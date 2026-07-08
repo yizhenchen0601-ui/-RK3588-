@@ -1,0 +1,88 @@
+#!/home/elf/miniconda3/envs/robot/bin/python
+"""DOA — 等vision就绪→有人脸跳过/没人脸监听"""
+import os,sys,time,json,subprocess as sp
+sys.path.insert(0,os.path.join(os.path.dirname(__file__),".."))
+import numpy as np
+from face_engine.mor_servo_dev import PCA9685,angle_to_pulse_us
+
+RATE=48000;CHUNK=int(RATE*0.04);NEEDED=10;THRESH=500
+sv=PCA9685(bus_id=4,address=0x42,freq_hz=50)
+def turn(t):
+    for p in np.arange(105,t,0.45 if t>105 else -0.45):
+        sv.set_servo_pulse_us(0,angle_to_pulse_us(p,0,180,600,2400));time.sleep(0.04)
+    sv.set_servo_pulse_us(0,angle_to_pulse_us(t,0,180,600,2400))
+def hold(t):
+    turn(t)
+    for _ in range(30):
+        try:
+            v=json.load(open("/tmp/morpheus_vision.json"))
+            if v.get("face_detected") and v.get("face_box"): return
+        except: pass
+        sv.set_servo_pulse_us(0,angle_to_pulse_us(t,0,180,600,2400));time.sleep(0.1)
+
+def kill_pa():
+    """杀PA（不用systemctl，SSH兼容）"""
+    sp.run(["pulseaudio","--kill"],stdout=sp.DEVNULL,stderr=sp.DEVNULL);time.sleep(0.3)
+    for _ in range(10):
+        sp.run(["pkill","-9","pulseaudio"],stdout=sp.DEVNULL,stderr=sp.DEVNULL)
+        if sp.run(["pgrep","-u",os.environ.get("USER","elf"),"pulseaudio"],stdout=sp.DEVNULL).returncode!=0:
+            return True
+        time.sleep(0.2)
+    return False
+
+def start_pa():
+    sp.run(["pulseaudio","--start"],stdout=sp.DEVNULL,stderr=sp.DEVNULL);time.sleep(1.5)
+    return sp.run(["pgrep","-u",os.environ.get("USER","elf"),"pulseaudio"],stdout=sp.DEVNULL).returncode==0
+
+# 等vision就绪（最多10s）
+print("[DOA] 等待vision就绪...")
+for _ in range(20):
+    try:
+        v=json.load(open("/tmp/morpheus_vision.json"))
+        if "face_detected" in v: break
+    except: pass
+    time.sleep(0.5)
+
+# 检查是否已有人脸
+try:
+    v=json.load(open("/tmp/morpheus_vision.json"))
+    if v.get("face_detected") and v.get("face_box"):
+        print("[DOA] 已有人脸，跳过")
+        sv.close(); exit(0)
+except: pass
+
+print("[DOA] 杀PA...")
+if kill_pa(): print("[DOA] PA已死")
+else: print("[DOA] PA杀不掉，继续尝试")
+
+proc=sp.Popen(["arecord","-D","plughw:4,0","-f","S16_LE","-r","48000","-c","4","-t","raw"],
+              stdout=sp.PIPE,stderr=sp.DEVNULL)
+print("[DOA] 监听中（12s超时）")
+t0=time.time()
+try:
+    while time.time()-t0<12:
+        r=proc.stdout.read(CHUNK*4*2)
+        if not r or len(r)<CHUNK*4*2:continue
+        a=np.frombuffer(r,dtype=np.int16).reshape(-1,4)
+        e2,e3=np.max(np.abs(a[:,2])),np.max(np.abs(a[:,3]))
+        if max(e2,e3)>THRESH:
+            vf=1
+            for _ in range(NEEDED):
+                r2=proc.stdout.read(CHUNK*4*2)
+                if r2:
+                    a2=np.frombuffer(r2,dtype=np.int16).reshape(-1,4)
+                    if max(np.max(np.abs(a2[:,2])),np.max(np.abs(a2[:,3])))>THRESH:vf+=1
+            if vf>=NEEDED:
+                sd="right" if e3-e2<0 else "left" if abs(e3-e2)>150 else "center"
+                print(f"[DOA] {sd}")
+                hold(55 if sd=="left" else 155 if sd=="right" else 105)
+                break
+        time.sleep(0.01)
+except:pass
+finally:
+    proc.terminate();sv.close()
+
+print("[DOA] 恢复PA...")
+if start_pa(): print("[DOA] PA就绪")
+else: print("[DOA] PA启动失败")
+print("[DOA] 完成")

@@ -1,0 +1,236 @@
+"""
+Morpheus 机器人头部系统 (RK3588)
+架构:
+  耳线程:       mic → AEC → ASR → text queue
+  主线程:       text → LLM(流式) → 逐句切分 → SpeechPipeline
+  SpeechPipeline: TTS→WAV→UniTalk→MLP→angles → aplay + 舵机(30fps同步)
+  共情接口:     shared_state → emotion 注入 LLM prompt
+  显示接口:     write_voice_state() → UI 显示对话
+"""
+import os, sys, time, queue, threading, re
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["TQDM_DISABLE"] = "1"
+
+import numpy as np
+from config import *
+from shared_state import shared, get_emotion_prompt, write_voice_state, read_vision_state
+from voice_pipeline.audio_io import AudioCapture, AudioPlayer, AECProcessor
+from voice_pipeline.asr_engine import StreamingASR
+from voice_pipeline.llm_client import RKLLMClient
+from voice_pipeline.tts_client import PiperTTS
+from face_engine.audio2face import Audio2Face
+from face_engine.servo_control import ServoController
+from face_engine.speech_pipeline import SpeechPipeline
+
+SENTENCE_BREAK = re.compile(r"[。！？～~]+")
+COMMA_BREAK = re.compile(r"[，；：—、]+")
+# 过滤 LLM 输出中的噪音
+LLM_NOISE = re.compile(
+    r"^\s*[IWE]\s+rkllm:|^[\s\-_=|/.()]+$|^\s*(Stage|Prefill|Generate|Peak|rtf_avg|100%)"
+    r"|\[transformers\]|use_return_dict"
+)
+
+
+class StreamEar:
+    """耳线程：mic → AEC → ASR → text queue"""
+    def __init__(self, aec=None, capture=None, player=None):
+        self.aec = aec
+        self._cap = capture
+        self._player = player
+        self.text_queue = queue.Queue(maxsize=8)
+        self.asr = StreamingASR()
+        self._stop = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def get_text(self, timeout=10):
+        try:
+            text = self.text_queue.get(timeout=timeout)
+            while not self.text_queue.empty():
+                try:
+                    text = self.text_queue.get_nowait()
+                except queue.Empty:
+                    break
+            return text
+        except queue.Empty:
+            return None
+
+    def _run(self):
+        cap = self._cap or AudioCapture().start()
+        self.asr.reset()
+        fc, energy_acc = 0, 0.0
+        had_partial = False
+        try:
+            while not self._stop.is_set():
+                frame = cap.read()
+                if len(frame) == 0:
+                    break
+                fc += 1
+                if self.aec and self._player:
+                    try:
+                        frame = self.aec.process(frame, self._player.ref_deque)
+                    except Exception:
+                        pass
+                af = frame.astype(np.float32) / 32768.0
+                rms = np.sqrt(np.mean(af ** 2))
+                if rms < NOISE_GATE:
+                    af = np.zeros_like(af)
+                energy_acc += rms
+                self.asr.accept_waveform(af)
+                if fc % PARTIAL_INTERVAL == 0:
+                    p = self.asr.get_partial()
+                    if p:
+                        had_partial = True
+                        print("\r  \U0001f3a4 " + p, end="", flush=True)
+                    elif had_partial:
+                        print("\r" + " " * 40, end="\r", flush=True)
+                        had_partial = False
+                if self.asr.is_endpoint():
+                    text = self.asr.finalize()
+                    self.asr.reset()
+                    avg_e = energy_acc / max(fc, 1)
+                    fc, energy_acc, had_partial = 0, 0.0, False
+                    if not text:
+                        continue
+                    if self._player and self._player.is_playing():
+                        self._player.interrupt()
+                    gate = ENERGY_THRESHOLD_HIGH if (self._player and self._player.is_playing()) else ENERGY_THRESHOLD
+                    if avg_e < gate / 32768.0 or len(text) < 2:
+                        continue
+                    print("\r  \u2705 " + text)
+                    self.text_queue.put(text)
+                    print("
+  u2705 " + text)
+                    self.text_queue.put(text)
+        finally:
+            if not self._cap:
+                cap.stop()
+
+
+def clean_llm_output(text):
+    """过滤 LLM 输出的噪音行"""
+    lines = text.split("\n")
+    clean = []
+    for line in lines:
+        if LLM_NOISE.search(line.strip()):
+            continue
+        clean.append(line)
+    return "".join(clean)
+
+
+def main():
+    print("=" * 50)
+    print("  Morpheus 机器人头部系统 (RK3588)")
+    print("  ASR + LLM + TTS + Audio2Face + 舵机 + 共情接口")
+    print("=" * 50)
+
+    aec = AECProcessor(ASR_SAMPLE_RATE) if ENABLE_AEC else None
+    print(f"  AEC: {'ON' if aec else 'OFF'}")
+    cap = AudioCapture().start()
+    player = AudioPlayer(aec=aec).start()
+    time.sleep(0.3)
+
+    tts = PiperTTS()
+    llm = RKLLMClient()
+
+    a2f = Audio2Face(lower_only=A2F_LOWER_ONLY)
+    a2f.initialize()
+    servo = ServoController()
+    servo.initialize()
+
+    speech_pipeline = SpeechPipeline(tts, a2f, servo, player=player)
+    ear = StreamEar(aec=aec, capture=cap, player=player).start()
+
+    # 初始语音状态
+    write_voice_state(speaking=False, status="idle", user_text="", bot_text="")
+
+    print()
+    print("=" * 50)
+    print("  系统就绪！")
+    print("  共情接口: shared_state.shared")
+    print("  显示接口: write_voice_state() → UI")
+    print("=" * 50)
+    print()
+    print("监听中...（说话打断播放）")
+    print("-" * 40)
+
+    try:
+        while True:
+            text = ear.get_text(timeout=None)
+            if text is None:
+                break
+            if not re.search(r"[一-鿿]", text):
+                print("  (无中文，忽略)")
+                continue
+
+            # 写入用户文本 → 供 UI 显示
+            write_voice_state(user_text=text, status="recognizing")
+
+            emotion_hint = get_emotion_prompt()
+            full_prompt = text
+            if emotion_hint:
+                full_prompt = f"[{emotion_hint}] " + text
+                print(f"  \U0001f60a {emotion_hint}")
+
+            # LLM 开始思考
+            write_voice_state(status="thinking")
+
+            print("  \U0001f916 ", end="", flush=True)
+            sent_buf = ""
+            full_response = ""
+            _t0 = time.time()
+            _tc = 0
+            for token in llm.chat(full_prompt):
+                _tc += 1
+                if LLM_NOISE.search(token):
+                    continue
+                print(token, end="", flush=True)
+                sent_buf += token
+                full_response += token
+
+                # 先按逗号切（积累>15字才切，避免碎片）
+                if len(sent_buf) > 15:
+                    m = COMMA_BREAK.search(sent_buf)
+                    if m and m.end() > 5:
+                        sentence = sent_buf[:m.end()].strip()
+                        sent_buf = sent_buf[m.end():]
+                        if len(sentence) >= 5:
+                            speech_pipeline.put(sentence)
+
+                # 再按句号/问号/感叹号切完整句
+                m = SENTENCE_BREAK.search(sent_buf)
+                if m:
+                    sentence = sent_buf[:m.end()].strip()
+                    sent_buf = sent_buf[m.end():]
+                    if len(sentence) >= 3:
+                        speech_pipeline.put(sentence)
+
+            print()
+
+            # 最后剩余的部分
+            if sent_buf.strip() and len(sent_buf.strip()) >= 3:
+                speech_pipeline.put(sent_buf.strip())
+
+            # 写入 bot 回复 → 供 UI 显示
+            write_voice_state(bot_text=full_response.strip(), status="speaking", token_speed=round(_tc/(time.time()-_t0),1))
+
+    except KeyboardInterrupt:
+        print("\n\n正在退出...")
+    finally:
+        speech_pipeline.stop()
+        ear.stop()
+        player.stop()
+        cap.stop()
+        llm.close()
+        servo.close()
+        print("  Bye!")
+
+
+if __name__ == "__main__":
+    main()
